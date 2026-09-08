@@ -11,15 +11,60 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta
 from glob import iglob
 
-from odoo import _, api, exceptions, fields, models, tools
+import paramiko
+
+from odoo import api, exceptions, fields, models, tools
 from odoo.exceptions import UserError
 from odoo.service import db
 
 _logger = logging.getLogger(__name__)
-try:
-    import pysftp
-except ImportError:  # pragma: no cover
-    _logger.debug("Cannot import pysftp")
+
+
+class SFTPConnection:
+    """SFTP connection with the small pysftp-compatible surface this module uses.
+
+    ``pysftp`` is unmaintained and breaks on paramiko >= 3, so the backend is
+    paramiko's own ``SSHClient``. Unlike the pysftp code this replaces, the
+    server host key is verified against the known_hosts of the user running
+    Odoo; an unknown host is refused instead of silently trusted.
+    """
+
+    def __init__(self, host, port, username, **kwargs):
+        self._ssh = paramiko.SSHClient()
+        self._ssh.load_system_host_keys()
+        self._ssh.set_missing_host_key_policy(paramiko.RejectPolicy())
+        try:
+            self._ssh.connect(hostname=host, port=port, username=username, **kwargs)
+            self._sftp = self._ssh.open_sftp()
+        except Exception:
+            self._ssh.close()
+            raise
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        self.close()
+
+    def __getattr__(self, name):
+        """Delegate everything else (open, listdir, unlink, ...) to paramiko."""
+        return getattr(self._sftp, name)
+
+    def close(self):
+        self._sftp.close()
+        self._ssh.close()
+
+    def makedirs(self, path):
+        """``mkdir -p``; paramiko's SFTPClient only creates one level."""
+        current = "/" if path.startswith("/") else ""
+        for part in path.split("/"):
+            if not part:
+                continue
+            current = f"{current.rstrip('/')}/{part}" if current else part
+            try:
+                self._sftp.stat(current)
+            except OSError:
+                self._sftp.mkdir(current)
 
 
 class DbBackup(models.Model):
@@ -27,14 +72,13 @@ class DbBackup(models.Model):
     _name = "db.backup"
     _inherit = "mail.thread"
 
-    _sql_constraints = [
-        ("name_unique", "UNIQUE(name)", "Cannot duplicate a configuration."),
-        (
-            "days_to_keep_positive",
-            "CHECK(days_to_keep >= 0)",
-            "I cannot remove backups from the future. Ask Doc for that.",
-        ),
-    ]
+    _name_unique = models.Constraint(
+        "UNIQUE(name)", "Cannot duplicate a configuration."
+    )
+    _days_to_keep_positive = models.Constraint(
+        "CHECK(days_to_keep >= 0)",
+        "I cannot remove backups from the future. Ask Doc for that.",
+    )
 
     name = fields.Char(
         compute="_compute_name",
@@ -106,14 +150,9 @@ class DbBackup(models.Model):
         """Get the right summary for this job."""
         for rec in self:
             if rec.method == "local":
-                rec.name = "%s @ localhost" % rec.folder
+                rec.name = f"{rec.folder} @ localhost"
             elif rec.method == "sftp":
-                rec.name = "sftp://%s@%s:%d%s" % (
-                    rec.sftp_user,
-                    rec.sftp_host,
-                    rec.sftp_port,
-                    rec.folder,
-                )
+                rec.name = f"sftp://{rec.sftp_user}@{rec.sftp_host}:{rec.sftp_port}{rec.folder}"
 
     @api.constrains("folder", "method")
     def _check_folder(self):
@@ -123,7 +162,7 @@ class DbBackup(models.Model):
                 tools.config.filestore(self.env.cr.dbname)
             ):
                 raise exceptions.ValidationError(
-                    _(
+                    self.env._(
                         "Do not save backups on your filestore, or you will "
                         "backup your backups too!"
                     )
@@ -134,14 +173,19 @@ class DbBackup(models.Model):
         try:
             # Just open and close the connection
             with self.sftp_connection():
-                raise UserError(_("Connection Test Succeeded!"))
-        except (
-            pysftp.CredentialException,
-            pysftp.ConnectionException,
-            pysftp.SSHException,
-        ) as exc:
+                return {
+                    "type": "ir.actions.client",
+                    "tag": "display_notification",
+                    "params": {
+                        "title": self.env._("Success"),
+                        "message": self.env._("Connection Test Succeeded!"),
+                        "type": "success",
+                        "sticky": False,
+                    },
+                }
+        except (paramiko.SSHException, OSError) as exc:
             _logger.info("Connection Test Failed!", exc_info=True)
-            raise UserError(_("Connection Test Failed!")) from exc
+            raise UserError(self.env._("Connection Test Failed!")) from exc
 
     def action_backup(self):
         """Run selected backups."""
@@ -154,14 +198,15 @@ class DbBackup(models.Model):
             with rec.backup_log():
                 # Directory must exist
                 try:
-                    os.makedirs(rec.folder)
+                    os.makedirs(rec.folder, exist_ok=True)
                 except OSError as exc:
-                    _logger.exception("Action backup - OSError: %s" % exc)
+                    _logger.exception(f"Action backup - OSError: {exc}")
 
                 with open(os.path.join(rec.folder, filename), "wb") as destiny:
                     # Copy the cached backup
                     if backup:
-                        with open(backup) as cached:
+                        # Ensure binary read to avoid unicode decoding errors
+                        with open(backup, "rb") as cached:
                             shutil.copyfileobj(cached, destiny)
                     # Generate new backup
                     else:
@@ -183,13 +228,10 @@ class DbBackup(models.Model):
 
                     with cached:
                         with rec.sftp_connection() as remote:
-                            # Directory must exist
                             try:
                                 remote.makedirs(rec.folder)
-                            except pysftp.ConnectionException as exc:
-                                _logger.exception(
-                                    "pysftp ConnectionException: %s" % exc
-                                )
+                            except OSError as exc:
+                                _logger.exception(f"SFTP makedirs failed: {exc}")
 
                             # Copy cached backup to remote server
                             with remote.open(
@@ -204,25 +246,27 @@ class DbBackup(models.Model):
     @api.model
     def action_backup_all(self):
         """Run all scheduled backups."""
-        return self.search([]).action_backup()
+        return self.search([]).action_backup()  # pylint: disable=no-search-all
 
     @contextmanager
     def backup_log(self):
         """Log a backup result."""
         try:
-            _logger.info("Starting database backup: %s", self.name)
+            _logger.info(f"Starting database backup: {self.name}")
             yield
         except Exception:
-            _logger.exception("Database backup failed: %s", self.name)
+            _logger.exception(f"Database backup failed: {self.name}")
             escaped_tb = tools.html_escape(traceback.format_exc())
             self.message_post(  # pylint: disable=translation-required
-                body="<p>%s</p><pre>%s</pre>"
-                % (_("Database backup failed."), escaped_tb),
+                body=(
+                    f"<p>{self.env._('Database backup failed.')}</p>"
+                    f"<pre>{escaped_tb}</pre>"
+                ),
                 subtype_id=self.env.ref("auto_backup.mail_message_subtype_failure").id,
             )
         else:
-            _logger.info("Database backup succeeded: %s", self.name)
-            self.message_post(body=_("Database backup succeeded."))
+            _logger.info(f"Database backup succeeded: {self.name}")
+            self.message_post(body=self.env._("Database backup succeeded."))
 
     def cleanup(self):
         """Clean up old backups."""
@@ -230,15 +274,13 @@ class DbBackup(models.Model):
         for rec in self.filtered("days_to_keep"):
             with rec.cleanup_log():
                 bu_format = rec.backup_format
-                file_extension = bu_format == "zip" and "dump.zip" or bu_format
+                file_extension = "dump.zip" if bu_format == "zip" else bu_format
                 oldest = self.filename(
                     now - timedelta(days=rec.days_to_keep), bu_format
                 )
 
                 if rec.method == "local":
-                    for name in iglob(
-                        os.path.join(rec.folder, "*.%s" % file_extension)
-                    ):
+                    for name in iglob(os.path.join(rec.folder, f"*.{file_extension}")):
                         if os.path.basename(name) < oldest:
                             os.unlink(name)
 
@@ -246,7 +288,7 @@ class DbBackup(models.Model):
                     with rec.sftp_connection() as remote:
                         for name in remote.listdir(rec.folder):
                             if (
-                                name.endswith(".%s" % file_extension)
+                                name.endswith(f".{file_extension}")
                                 and os.path.basename(name) < oldest
                             ):
                                 remote.unlink(f"{rec.folder}/{name}")
@@ -256,20 +298,20 @@ class DbBackup(models.Model):
         """Log a possible cleanup failure."""
         self.ensure_one()
         try:
-            _logger.info(
-                "Starting cleanup process after database backup: %s", self.name
-            )
+            _logger.info(f"Starting cleanup process after database backup: {self.name}")
             yield
         except Exception:
-            _logger.exception("Cleanup of old database backups failed: %s")
+            _logger.exception(f"Cleanup of old database backups failed: {self.name}")
             escaped_tb = tools.html_escape(traceback.format_exc())
             self.message_post(  # pylint: disable=translation-required
-                body="<p>%s</p><pre>%s</pre>"
-                % (_("Cleanup of old database backups failed."), escaped_tb),
+                body=(
+                    f"<p>{self.env._('Cleanup of old database backups failed.')}</p>"
+                    f"<pre>{escaped_tb}</pre>"
+                ),
                 subtype_id=self.env.ref("auto_backup.failure").id,
             )
         else:
-            _logger.info("Cleanup of old database backups succeeded: %s", self.name)
+            _logger.info(f"Cleanup of old database backups succeeded: {self.name}")
 
     @staticmethod
     def filename(when, ext="zip"):
@@ -295,10 +337,10 @@ class DbBackup(models.Model):
             "Trying to connect to sftp://%(username)s@%(host)s:%(port)d", extra=params
         )
         if self.sftp_private_key:
-            params["private_key"] = self.sftp_private_key
+            params["key_filename"] = self.sftp_private_key
             if self.sftp_password:
-                params["private_key_pass"] = self.sftp_password
+                params["passphrase"] = self.sftp_password
         else:
             params["password"] = self.sftp_password
 
-        return pysftp.Connection(**params)
+        return SFTPConnection(**params)
